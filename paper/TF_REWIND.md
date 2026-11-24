@@ -94,6 +94,14 @@ Given a target relative error tolerance $\epsilon_{\text{tol}}$ (e.g., $\epsilon
 
 **Guarantee:** Every single head $(l, h)$ is **runtime-certified to relative state error $\le \epsilon_{\text{tol}}$ with zero stationarity assumption and zero checkpoints.** For long-context serving ($T = 32\text{K}\text{–}128\text{K}$) with strictly bounded $O(1)$ tape RAM, pairing the ring tape ($L_{\text{ring}}$ tokens) with **one single sliding anchor checkpoint** at $t = T - L_{\text{ring}}$ (`144 MiB` total, vs $O(T/B)$ checkpoints in ReplaySSM) ensures any non-stationary head that reaches the ring boundary simply terminates at `anchor_pos` (`mode = 3`) with exact recovery.
 
+### 2.6 Theorem 5 — Single-GEMM Parallel Chunk Backward Inversion
+
+Unlike forward Gated DeltaNet replay — where each step $t$ has a sequential data dependency on $S_{t-1} k_t$ — once the innovation vectors $c_t$ are recorded, **backward $c_t$-Inverse has zero temporal data dependency across $t \in [P, T)$**. Unrolling Eq. (4) across an entire block of length $\Delta = T - P$ yields:
+
+$$S_T = A_{\text{back}} S_P \;+\; \sum_{t=P}^{T-1} \underbrace{\left(\prod_{m=t+1}^{T-1} \alpha_m\right) c_t}_{\tilde{c}_t} k_t^\top \quad \Longleftrightarrow \quad \boxed{\;S_P = \frac{1}{A_{\text{back}}}\Big(S_T - \tilde{C} K^\top\Big)\;} \tag{11}$$
+
+where $\tilde{C} \in \mathbb{R}^{d_v \times \Delta}$ and $K \in \mathbb{R}^{d_k \times \Delta}$. Rewinding an entire $\Delta$-token block backward on every slow/medium head collapses from a $\Delta$-step sequential loop into **one single batched Tensor-Core GEMM** ($\tilde{C} K^\top$) followed by one scalar division by $A_{\text{back}}$. On PyTorch (`H=48, D=128, Delta=64`), Theorem 5 runs **`19.0×` faster** than sequential backward inversion (`0.67 ms` vs `12.67 ms`, `MaxRelErr = 1.29e-6`).
+
 ---
 
 ## 3. Bare-Metal GPU Implementation (`m4lm`)
@@ -188,17 +196,63 @@ An 816-token specification manual with a secret key (`ORION-8391-ZETA`) at token
 
 ---
 
-## 5. Limitations, Trade-Offs & Extensions
+## 5. Reversible Zero-State-Checkpoint Training (`TF-Rewind-ChunkGrad`)
 
-- **Latency/Memory Crossover with ReplaySSM:** When rewinding by a large fraction of the context ($\Delta \gtrsim B$) on a single long stream, `ReplaySSM (Tape)` with coarse periodic checkpoints ($B \approx 256\text{–}512$) approaches similar step counts to `TF-Rewind (Cert)` at $\Delta = 128$ (`17.79 ms` vs `17.76 ms`), while trading $O(T/B)$ checkpoint RAM against TF-Rewind's $O(\Delta_{\max})$ $c_t$ ring buffer. Conversely, for local rewinds ($\Delta \ll B$ — speculative rollback, agent tool retries, prompt edits, tree-of-thought branching), TF-Rewind eliminates ReplaySSM's $B$-token boundary cliff and avoids storing dense checkpoints across the entire context.
-- **Unbounded Contexts ($T \gg L_{\text{ring}}$):** In pure zero-checkpoint `TF-Rewind (Cert)`, an adversarial non-stationary head ($\kappa = 0$) may extend back to $t = 0$. Pairing TF-Rewind's bounded ring buffer ($L_{\text{ring}}$ tokens) with **1 single sliding anchor** at $t = T - L_{\text{ring}}$ caps both RAM and worst-case extension depth to $O(L_{\text{ring}})$ completely independent of $T$.
-- **Generality:** Theorems 1–4 apply directly to **any** scalar-gated or diagonal-gated linear recurrence ($S_t = A_t S_{t-1} + c_t k_t^\top$), including **Mamba-2**, **Gated DeltaNet-2**, **RWKV-7**, **GLA**, and **Kimi Delta Attention (KDA)**.
+While ReplaySSM's deferred-commit scheme is inference-only, **long-context training, fine-tuning, and Test-Time Training (TTT)** must backpropagate through all $T$ tokens. Standard chunkwise FlashLinearAttention (`chunk_gated_delta_rule`) saves full $d_v \times d_k$ state checkpoints $S_c$ at every chunk boundary ($C = 64$), consuming **`288.0 GiB`** of state-checkpoint activation memory per 128K sequence on `Qwen3.8-27B`.
+
+**`TF-Rewind-ChunkGrad`** ([tf_rewind_grad_torch.py](../examples/tf_rewind_grad_torch.py)) eliminates **all $O((T/C) \cdot d^2)$ chunk-boundary state checkpoints**, saving only the terminal state $S_T$ ($O(1)$ in $T$) plus the $O(d)$ innovation tape $c_t$. Walking chunks backward $c = M-1 \dots 0$:
+- Well-conditioned heads jump from $S_{c+1} \to S_c$ via **one Theorem 5 Single-GEMM** (zero recompute steps).
+- Fast-decay or non-stationary heads exceeding amplification limit $e^{5.5}$ refresh $S_c$ once per chunk boundary via certified zero-start warmup ($\prod \alpha_t \le e^{-12.5}$).
+
+Verified against exact PyTorch `autograd` (`T=512, H=32, D=64, C=64`, realistic Qwen3.8 decay spectrum + $\beta = 0.999$ spikes + adversarial $\kappa \ll 1$ non-stationary flushes):
+
+| Gradient | Rel $L_2$ Err | Cosine Sim (fp64) | Max Abs Err |
+| :--- | ---: | ---: | ---: |
+| `dQ` | `7.05e-6` | **`0.999999999975`** | `2.34e-4` |
+| `dK` | `1.35e-6` | **`0.999999999999`** | `5.80e-4` |
+| `dV` | `1.44e-7` | **`1.000000000000`** | `3.81e-6` |
+| `dAlpha` | `8.43e-6` | **`0.999999999965`** | `4.60e-3` |
+| `dBeta` | `1.34e-6` | **`0.999999999999`** | `7.11e-4` |
+
+- **25-Step AdamW Convergence:** Training loss trajectories match exact autograd to **`1.19e-7` max loss gap** across all 25 steps (`1.172825 → 0.812223`) with **zero state checkpoints**.
+- **Activation RAM on `Qwen3.8-27B @ 128K`:** Cuts state-checkpoint memory from **`288.0 GiB`** (`C=64` FLA) down to **`144.0 GiB`** (all-head fp32 $c_t$, **`2.0×`** smaller) or **`93.6 GiB`** (sparse slow/med fp32 $c_t$, **`3.1×`** smaller; **`197×`** smaller than unchunked BPTT).
 
 ---
 
-## 6. Reproducibility
+## 6. Bidirectional ReplaySSM for Unplanned Radix Prefix Splitting
+
+In multi-tenant serving (vLLM / SGLang RadixAttention), incoming requests diverge from cached prefixes at **unplanned** mid-block token positions $P \in [a_k, a_{k+1}]$. Combining **ReplaySSM** (forward from $a_k$ when $P$ is in the first half of the block) with **Theorem 5 Single-GEMM `TF-Rewind (Cert)`** (backward from $a_{k+1}$ when $P$ is in the second half, falling back to anchor $a_k$ for adversarial non-stationary heads) strictly dominates forward-only ReplaySSM ([bidirectional_radix_bench.py](../examples/bidirectional_radix_bench.py), `B=256, H=48, D=128`):
+
+| Unplanned Split $P$ | Forward-Only `ReplaySSM` | **Bidirectional (`ReplaySSM + TF-Rewind`)** | Speedup | MaxRelErr | Heads $< 10^{-3}$ |
+| :---: | :---: | :---: | ---: | ---: | :---: |
+| `32` | `32` stp (`8.11 ms`) | `FWD(ReplaySSM)` `32.0` stp (`7.45 ms`) | `1.09×` | `0.00e0` | `48/48` |
+| `160` | `160` stp (`34.69 ms`) | `BWD(TF-Rewind)` `75.4` stp (`17.47 ms`) | **`1.99×`** | `1.25e-5` | **`48/48`** |
+| `224` | `224` stp (`54.41 ms`) | `BWD(TF-Rewind)` `37.5` stp (`17.76 ms`) | **`3.06×`** | `3.73e-5` | **`48/48`** |
+| `240` | `240` stp (`57.57 ms`) | `BWD(TF-Rewind)` `15.1` stp (`2.87 ms`) | **`20.02×`** | `9.44e-6` | **`48/48`** |
+| `252` | `252` stp (`60.98 ms`) | `BWD(TF-Rewind)` `4.2` stp (`2.06 ms`) | **`29.67×`** | `1.62e-5` | **`48/48`** |
+
+- **`3.20×` mean wall-clock speedup** across unplanned splits (`20.0×–29.7×` on late-block edits) with **`48/48` (100%)** heads certified `< 3.73e-5`.
+- **Halves ReplaySSM Checkpoint RAM (`2.0×`):** At matched worst-case replay distance ($\le 128$ tokens on 27B), checkpoint memory drops from **`36.0 GiB → 18.0 GiB`** at 32K context (`4.50 GiB → 2.25 GiB` at 4K).
+
+---
+
+## 7. Limitations, Trade-Offs & Extensions
+
+- **Latency/Memory Crossover with ReplaySSM:** For a single pre-planned rollback point, storing one checkpoint (`144 MiB`) is cheaper and bit-exact vs. TF-Rewind's `281 MiB` ring buffer. TF-Rewind shines on **unplanned boundaries** (multi-tenant prefix splitting, live mid-stream edits), as a **bidirectional add-on to ReplaySSM** (Section 6), and in **reversible long-context training** (Section 5) where ReplaySSM does not apply.
+- **Unbounded Contexts ($T \gg L_{\text{ring}}$):** Pairing TF-Rewind's bounded ring buffer ($L_{\text{ring}}$ tokens) with **1 single sliding anchor** at $t = T - L_{\text{ring}}$ (or coarse ReplaySSM anchors) caps both RAM and worst-case extension depth to $O(L_{\text{ring}})$ completely independent of $T$.
+- **Generality:** Theorems 1–5 apply directly to **any** scalar-gated or diagonal-gated linear recurrence ($S_t = A_t S_{t-1} + c_t k_t^\top$), including **Mamba-2**, **Gated DeltaNet-2**, **RWKV-7**, **GLA**, and **Kimi Delta Attention (KDA)**.
+
+---
+
+## 8. Reproducibility
 
 ```bash
+# Standalone PyTorch verification (CPU or CUDA — no Mac/Zig required)
+python3 examples/tf_rewind_torch.py              # Theorems 1-4 (0 checkpoints, adversarial kappa<<1)
+python3 examples/tf_rewind_grad_torch.py         # Theorem 5 GEMM + Reversible GDN Backprop + AdamW
+python3 examples/bidirectional_radix_bench.py    # Bidirectional ReplaySSM + TF-Rewind unplanned splits
+
+# Bare-Metal Apple Silicon Qwen3.5 / Qwen3.8-27B benchmarks
 zig build --release=fast
 ./zig-out/bin/m4lm tf-rewind      MODEL_DIR --window 64 --gen 64
 ./zig-out/bin/m4lm tf-rewind-demo MODEL_DIR --repeats 14

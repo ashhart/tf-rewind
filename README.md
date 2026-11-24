@@ -96,14 +96,37 @@ An 816-token specification manual containing a secret key (`ORION-8391-ZETA`) ne
 
 ---
 
-## Quickstart: Verify & Reproduce TF-Rewind
+## Beyond Single-Stream Inference: Three New Verified Results
 
-### Option A — Verify Theorems 1–4 in 3 Seconds (PyTorch · Any CPU, CUDA, or Mac)
+### 1. Theorem 5 — Single-GEMM Parallel Chunk Backward Inversion (`19.0×` Faster)
+Unlike forward GDN replay (sequential dependency on $S_{t-1} k_t$), once $c_t$ is logged, backward $c_t$-Inverse has **zero temporal data dependency** across $t \in [P, T)$:
 
-No Apple Silicon or Zig required — run the standalone PyTorch reference to verify singularity-free $c_t$-Inverse, non-stationary decay drift ($\kappa \ll 1$), $\beta = 0.999$ write-gate spikes, and runtime-certified recovery (`64/64` heads $< 10^{-4}$):
+$$S_P = \frac{1}{A_{\text{back}}}\Big(S_T - \tilde{C} K^\top\Big), \qquad \tilde{c}_j = \left(\prod_{m=j+1}^{T-1}\alpha_m\right) c_j$$
+
+Rewinding an entire $\Delta$-token block collapses from a sequential loop into **one batched Tensor-Core GEMM** — verified **`19.0×` faster** (`0.67 ms` vs `12.67 ms`, `MaxRelErr = 1.29e-6`) on `H=48, D=128, Δ=64`.
+
+### 2. `TF-Rewind-ChunkGrad` — Zero-State-Checkpoint Reversible GDN Backprop (Training & TTT)
+While ReplaySSM is inference-only, long-context Gated DeltaNet training (`chunk_gated_delta_rule` in FLA) normally saves full $d_v \times d_k$ chunk-boundary state checkpoints $S_c$ every $C = 64$ tokens (**`288.0 GiB`** per 128K sequence on 27B). **`TF-Rewind-ChunkGrad`** ([examples/tf_rewind_grad_torch.py](examples/tf_rewind_grad_torch.py)) eliminates **100% of chunk-state checkpoints**, jumping backward chunk-to-chunk via Theorem 5 Single-GEMM and refreshing fast/non-stationary heads only at chunk boundaries:
+- **11-Nines Gradient Fidelity vs. Exact PyTorch Autograd** (with $\beta = 0.999$ spikes & adversarial $\kappa \ll 1$ flushes): `dQ` `7.05e-6` (`cos = 0.999999999975`), `dK` `1.35e-6`, `dV` `1.44e-7` (`cos = 1.000000000000`), `dAlpha` `8.43e-6`, `dBeta` `1.34e-6`.
+- **25-Step AdamW Training Convergence:** Loss matches exact autograd to **`1.19e-7`** (`1.172825 → 0.812223`) with **zero state checkpoints**, cutting 27B@128K state-checkpoint RAM **`2.0×–3.1×`** below `C=64` FLA (`288 GiB → 93.6–144 GiB`).
+
+### 3. Bidirectional ReplaySSM (`ReplaySSM + TF-Rewind`) for Unplanned Radix Prefix Splits
+In multi-tenant serving (vLLM / SGLang RadixAttention), requests diverge mid-block at unplanned token positions $P \in [a_k, a_{k+1}]$. Replaying forward from $a_k$ in the first half and **Theorem-5 Single-GEMM `TF-Rewind`** backward from $a_{k+1}$ in the second half ([examples/bidirectional_radix_bench.py](examples/bidirectional_radix_bench.py), `B=256, H=48, D=128`):
+- **`3.20×` mean wall-clock speedup** across unplanned splits (**`20.0×–29.7×` faster** on late-block splits `P=240, 252`), **`48/48` (100%)** heads certified `< 3.73e-5`.
+- **Cuts ReplaySSM checkpoint RAM in half (`2.0×`)** at equal worst-case replay distance (`36.0 GiB → 18.0 GiB` at 32K context on 27B).
+
+---
+
+## Quickstart: Verify & Reproduce Everything
+
+### Option A — Verify All 5 Theorems, Reversible Backprop & Bidirectional ReplaySSM in PyTorch (Any CPU / CUDA)
+
+No Apple Silicon or Zig required — each script runs in ~3–8 seconds:
 
 ```bash
-python3 examples/tf_rewind_torch.py
+python3 examples/tf_rewind_torch.py              # Theorems 1-4: 0-ckpt rewind + adversarial kappa<<1 + beta=0.999
+python3 examples/tf_rewind_grad_torch.py         # Theorem 5 Single-GEMM (19x) + Reversible GDN Backprop + AdamW
+python3 examples/bidirectional_radix_bench.py    # Bidirectional ReplaySSM + TF-Rewind on unplanned prefix splits
 ```
 
 ### Option B — Full Bare-Metal `Qwen3.5` / `Qwen3.8-27B` Benchmarks (Apple Silicon · Zig `0.17+`)
@@ -121,10 +144,13 @@ zig build --release=fast
 
 # 2. Run the live Needle-in-a-Haystack Ctrl-Z demo (Cold Re-Prefill vs Tail-Replay vs TF-Rewind)
 ./zig-out/bin/m4lm tf-rewind-demo MODEL_DIR --repeats 14
+
+# 3. Independently verify m4lm vs stock Apple mlx_lm on your Mac
+python3 bench/bench_all_vs_mlx.py --model 27b
 ```
 
 Core TF-Rewind files:
-- Standalone PyTorch reference & verifier: [examples/tf_rewind_torch.py](examples/tf_rewind_torch.py)
+- Standalone PyTorch verifiers: [examples/tf_rewind_torch.py](examples/tf_rewind_torch.py), [examples/tf_rewind_grad_torch.py](examples/tf_rewind_grad_torch.py), [examples/bidirectional_radix_bench.py](examples/bidirectional_radix_bench.py)
 - Metal GPU kernels (`gdn_scan_record_corr`, `gdn_rewind_dual`): [kernels/gdn_ops.metal](kernels/gdn_ops.metal#L616-L728)
 - Host planner, runtime-certified non-stationary selector, ReplaySSM benchmarks & Ctrl-Z demo: [src/dual_rewind.zig](src/dual_rewind.zig)
 - Full technical paper & proofs: [paper/TF_REWIND.md](paper/TF_REWIND.md)
