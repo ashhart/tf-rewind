@@ -1,14 +1,16 @@
-# TF-Rewind — Exact Arbitrary-Boundary State Rewind for Hybrid Linear-Attention LLMs
+# TF-Rewind — Near-Exact Arbitrary-Boundary State Rewind for Hybrid Linear-Attention LLMs
 
 **TensorFold Research** · Paper: [paper/TF_REWIND.md](paper/TF_REWIND.md) · 3-Second Verifier: [examples/tf_rewind_torch.py](examples/tf_rewind_torch.py) · Bare-Metal Engine: `m4lm` (Zig + direct Metal, zero Apple MLX)
 
 ![TF-Rewind Hero Figure](assets/tf_rewind_hero.png)
 
-**TF-Rewind** introduces **Forget–Invert Duality** and **Runtime-Certified Adaptive Replay** — allowing hybrid linear-attention / Gated DeltaNet (GDN) LLMs (`Qwen3.5`, `Qwen3.8`, Mamba-2, RWKV-7, GLA, KDA) to **rewind ("Ctrl-Z") their recurrent state to any arbitrary past token position** in milliseconds with **100% head certification (`2,304/2,304` heads on 27B)** and **zero checkpoints**, eliminating both the $O(T/B)$ checkpoint overhead / boundary cliffs of `ReplaySSM` and the slow-head hallucinations of `Tail-Replay`.
+**TF-Rewind** introduces **Singularity-Free $c_t$-Inverse**, **Non-Stationary Forget–Invert Duality**, and **Runtime-Certified Adaptive Replay** — allowing hybrid linear-attention / Gated DeltaNet (GDN) LLMs (`Qwen3.5`, `Qwen3.8`, Mamba-2, RWKV-7, GLA, KDA) to **rewind their recurrent state backward to any unplanned past token position** in milliseconds with **100% head certification (`2,304/2,304` heads $\le 7.8\times 10^{-5}$ on 27B, 100% token parity)** and **zero checkpoints**.
+
+> **Relationship to ReplaySSM (NVIDIA & Dao AI Lab):** [ReplaySSM](https://developer.nvidia.com/blog/replayssm-rethinking-state-storage-for-faster-hybrid-model-decoding/) already solves *planned* speculative-decoding rollback cleanly via deferred input commit, and reconstructs states *forward* from periodic checkpoints. **TF-Rewind is complementary:** it is the first method that **inverts Gated DeltaNet backward** without write-gate singularities and routes per head with a runtime error certificate — targeting **unplanned rewind boundaries** (arbitrary partial prefix-cache splits, mid-stream backtracking, and as a **bidirectional add-on to ReplaySSM** that cuts checkpoint density and worst-case replay distance in half).
 
 ---
 
-## Why Hybrid LLMs Couldn't "Ctrl-Z" — Until Now
+## Why Unplanned Rewind Is Hard in Hybrid LLMs
 
 In a pure Transformer, rewinding from token $T$ back to any earlier token $P = T - \Delta$ is free: just truncate the KV cache index (`pos = P`).
 
@@ -16,9 +18,9 @@ In a **hybrid Gated DeltaNet (GDN) + GQA model** (such as `Qwen3.5` and `Qwen3.8
 
 $$S_t = \alpha_t S_{t-1}\left(I - \beta_t k_t k_t^\top\right) + \beta_t v_t k_t^\top$$
 
-Because $S_t$ overwrites $S_{t-1}$ in place, rewinding to an un-checkpointed position $P$ previously forced a painful trade-off:
-- **Periodic Checkpointing (`ReplaySSM`)** — saves `144 MiB` per checkpoint ($O(T/B)$ RAM: `9.2 GiB` for $B=64$ at 4K context), and still suffers a **$B$-token boundary cliff** whenever you undo a few tokens right before the next checkpoint (`792.9 ms` to undo 4 tokens on 27B at $B=243$).
-- **2026 SOTA `Tail-Replay`** (zero-start forward replay over a short window) — breaks on the **`59%–65%` of real trained GDN heads with slow decay ($\alpha \ge 0.95$)**, causing state drift and hallucinations.
+For a *known, pre-planned* branch point, saving a single `144 MiB` checkpoint is simpler and bit-exact. The hard case is **rewinding to an unplanned boundary $P$ you didn't mark ahead of time** (e.g., a multi-tenant prefix cache splitting mid-block when Request 2 edits a prompt 40 tokens before the end, or mid-generation backtracking):
+- **Forward-Only Periodic Checkpointing (`ReplaySSM`)** — bit-exact, but requires $O(T/B)$ checkpoints (`144 MiB` each; `9.2 GiB` for $B=64$ at 4K context) and hits a **$B$-token boundary cliff** when an unplanned split lands just before the next checkpoint (forcing `240` forward steps to undo `4` tokens at $B=243$: `20.4 ms` with buffered GDN tape, or `792.9 ms` with full-model replay).
+- **Zero-Checkpoint `Tail-Replay`** (zero-start forward replay over a short window) — breaks on the **`59%–65%` of real trained GDN heads with slow decay ($\alpha \ge 0.95$)**, causing state drift and hallucinations.
 - **Naive Sherman–Morrison algebraic inversion** — explodes to `NaN` because **`76%–90%` of real trained GDN heads hit $\beta_t \ge 0.90$**, making $(1 - \beta_t \|k_t\|_2^2)^{-1}$ singular.
 
 ---
@@ -77,9 +79,9 @@ Rewinding from $T = 487$ (`Cold` re-prefill = `1.22–2.10 s`; `ReplaySSM` perio
 | **128** | `TF-Rewind (2D, fixed-r)` | `0` | `1274/1030` | `0` | `130.9` | `28.32 ms` | `1.28e-6` | `6.47e-2` | `2178/2304` | `4.20e-6` | `32/32` |
 | **128** | **`TF-Rewind (Cert, Ours)`** | **`0`** | `1019/1285` | `447` | **`160.6`** | **`17.76 ms`** | **`7.41e-7`** | **`7.78e-5`** | **`2304/2304`** | **`3.90e-6`** | **`32/32`** |
 
-- **`2,304 / 2,304` (100% of heads)** certified below `7.78e-5` worst-case relative error AND **`160 / 160` (100% exact continuation parity)** across every $\Delta \in \{4, 16, 32, 64, 128\}$ with **zero checkpoints**.
-- **`31×–201×` faster than `ReplaySSM (Full)`**, up to **`5.2×` faster than `ReplaySSM (Tape)`** on short rewinds (`9.7` vs `240` avg steps at $\Delta=4$), and **`1,510,000×` lower KL divergence** than 2026 SOTA `Tail-Replay` at $\Delta = 128$ (`3.90e-6` vs `5.88`).
-- **Itemized Memory (`Qwen3.8-27B`):** 1 state checkpoint = `144.0 MiB`; Shared `(k,v,a,b)` = `781.5 KiB/tok`; Incremental `c_t` (fp32, last $\Delta_{\max}$ only) = `1,152.0 KiB/tok`; Conv `qkv` = `960.0 KiB/tok`. Full arbitrary-boundary ring buffer ($\Delta \le 64$) = **`281.3 MiB`** (`1.95×` one checkpoint, $O(\Delta_{\max})$ independent of $T$, vs **`9.2 GiB`** for ReplaySSM $B=64$ at $T=4{,}096$).
+- **`2,304 / 2,304` (100% of heads)** certified below `7.78e-5` worst-case relative error (`1e-7` median fp32 drift — near-exact vs bit-exact checkpoints) AND **`160 / 160` (100% greedy continuation token parity)** across every $\Delta \in \{4, 16, 32, 64, 128\}$ with **zero checkpoints**.
+- **Honest comparison vs. ReplaySSM (`B = 243`):** Against **buffered `ReplaySSM (Tape)`**, TF-Rewind is **`3.4×–5.2×` faster** on short unplanned rewinds (`3.95 ms` / `9.7` avg steps vs `20.38 ms` / `240` steps at $\Delta = 4$) and **matches latency** at $\Delta = 128$ (`17.76 ms` vs `17.79 ms`) with zero checkpoints; against **full-model `ReplaySSM (Full)`**, it is **`31×–201×` faster** (`3.95–17.76 ms` vs `551–1,064 ms`); against zero-checkpoint `Tail-Replay`, it cuts KL divergence up to **`1,510,000×`** (`3.90e-6` vs `5.88`).
+- **Itemized Memory (`Qwen3.8-27B`):** 1 state checkpoint = `144.0 MiB` (cheaper than TF-Rewind if you only need *one pre-planned* rollback point). TF-Rewind's per-token tape is `781.5 KiB/tok` shared `(k,v,a,b)` + `1,152.0 KiB/tok` incremental `c_t` (fp32, last $\Delta_{\max}$ only) + `960.0 KiB/tok` conv `qkv` → full arbitrary-boundary ring buffer ($\Delta \le 64$) = **`281.3 MiB`** (`1.95×` one checkpoint, constant $O(\Delta_{\max})$ independent of $T$, vs **`9.2 GiB`** for $B=64$ periodic checkpoints at $T=4{,}096$).
 - Full cross-scale results (`Qwen3.5-0.8B`, `Qwen3.5-2B`, `Qwen3.8-27B`) and proofs are in [paper/TF_REWIND.md](paper/TF_REWIND.md).
 
 ### Live End-to-End "Needle-in-a-Haystack Ctrl-Z" Demo (`m4lm tf-rewind-demo`)
