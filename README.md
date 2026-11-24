@@ -1,6 +1,8 @@
 # TF-Rewind — Exact Arbitrary-Boundary State Rewind for Hybrid Linear-Attention LLMs
 
-**TensorFold Research** · Paper: [paper/TF_REWIND.md](paper/TF_REWIND.md) · Bare-Metal Engine: `m4lm` (Zig + direct Metal, zero Apple MLX, zero external dependencies)
+**TensorFold Research** · Paper: [paper/TF_REWIND.md](paper/TF_REWIND.md) · 3-Second Verifier: [examples/tf_rewind_torch.py](examples/tf_rewind_torch.py) · Bare-Metal Engine: `m4lm` (Zig + direct Metal, zero Apple MLX)
+
+![TF-Rewind Hero Figure](assets/tf_rewind_hero.png)
 
 **TF-Rewind** introduces **Forget–Invert Duality** and **Runtime-Certified Adaptive Replay** — allowing hybrid linear-attention / Gated DeltaNet (GDN) LLMs (`Qwen3.5`, `Qwen3.8`, Mamba-2, RWKV-7, GLA, KDA) to **rewind ("Ctrl-Z") their recurrent state to any arbitrary past token position** in milliseconds with **100% head certification (`2,304/2,304` heads on 27B)** and **zero checkpoints**, eliminating both the $O(T/B)$ checkpoint overhead / boundary cliffs of `ReplaySSM` and the slow-head hallucinations of `Tail-Replay`.
 
@@ -92,9 +94,19 @@ An 816-token specification manual containing a secret key (`ORION-8391-ZETA`) ne
 
 ---
 
-## Quickstart: Build & Reproduce TF-Rewind
+## Quickstart: Verify & Reproduce TF-Rewind
 
-Requires macOS on Apple Silicon (Metal) and Zig `0.17+`. Zero external libraries, zero Apple MLX.
+### Option A — Verify Theorems 1–4 in 3 Seconds (PyTorch · Any CPU, CUDA, or Mac)
+
+No Apple Silicon or Zig required — run the standalone PyTorch reference to verify singularity-free $c_t$-Inverse, non-stationary decay drift ($\kappa \ll 1$), $\beta = 0.999$ write-gate spikes, and runtime-certified recovery (`64/64` heads $< 10^{-4}$):
+
+```bash
+python3 examples/tf_rewind_torch.py
+```
+
+### Option B — Full Bare-Metal `Qwen3.5` / `Qwen3.8-27B` Benchmarks (Apple Silicon · Zig `0.17+`)
+
+Zero external libraries, zero Apple MLX:
 
 ```bash
 zig build --release=fast
@@ -109,10 +121,12 @@ zig build --release=fast
 ./zig-out/bin/m4lm tf-rewind-demo MODEL_DIR --repeats 14
 ```
 
-Core TF-Rewind implementation files:
+Core TF-Rewind files:
+- Standalone PyTorch reference & verifier: [examples/tf_rewind_torch.py](examples/tf_rewind_torch.py)
 - Metal GPU kernels (`gdn_scan_record_corr`, `gdn_rewind_dual`): [kernels/gdn_ops.metal](kernels/gdn_ops.metal#L616-L728)
 - Host planner, runtime-certified non-stationary selector, ReplaySSM benchmarks & Ctrl-Z demo: [src/dual_rewind.zig](src/dual_rewind.zig)
 - Full technical paper & proofs: [paper/TF_REWIND.md](paper/TF_REWIND.md)
+- Hero figure generator: [bench/plot_hero.py](bench/plot_hero.py)
 
 ---
 
