@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "m4lm"
+version = "0.2.0"
+description = "Clean-room direct-Metal LLM inference engine replacing Apple MLX / mlx-lm"
+requires-python = ">=3.10"
+
+[project.scripts]
+"m4lm.generate" = "m4lm.generate:main"
+"m4lm.server" = "m4lm.server:main"
