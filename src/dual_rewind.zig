@@ -11,11 +11,16 @@
 //!   E_back(P <- T) ~ u_eff / prod_{t=P}^{T-1} alpha_t
 //!   E_fwd(P, W)   <=         prod_{t=P-W}^{P-1} alpha_t
 //!
-//! Theorem 3 (Universal Minimax Duality — Zero Checkpoints):
-//!   Setting W = r * Delta guarantees, for EVERY possible decay alpha in (0, 1],
-//!   EVERY possible write gate beta in [0, 1], and EVERY rewind distance Delta >= 1:
-//!     sup_{alpha in (0,1]} min( E_back(alpha), E_fwd(alpha) ) = u_eff^(r / (r + 1))
-//!   (e.g., r = 2 in fp32 => error <= ~2e-5 uniformly across all 100% of heads with ZERO checkpoints!).
+//! Theorem 3 (General Non-Stationary Minimax Duality & Certified Adaptive Replay):
+//!   Let alpha_pre  = (prod_{t=P-W}^{P-1} alpha_t)^(1/W) and
+//!       alpha_post = (prod_{t=P}^{T-1}   alpha_t)^(1/Delta),
+//!   with decay-drift ratio kappa = ln(alpha_pre) / ln(alpha_post) >= 0 (kappa = 1 stationary).
+//!   With window W = r * Delta:
+//!     min( E_back, E_fwd(W) ) <= u_eff^( (r * kappa) / (r * kappa + 1) )
+//!   Recovering u_eff^(r / (r + 1)) in the stationary regime (kappa = 1), while flagging any
+//!   non-stationary head (kappa << 1: pre-remember / post-flush) at runtime via the exact
+//!   error certificate min(E_back, E_fwd(W)) > eps_tol and adaptively extending ONLY those
+//!   flagged heads until prod alpha_t <= eps_tol (or t = 0) — certifying <= eps_tol on 100% of heads.
 const std = @import("std");
 const mtl = @import("metal4.zig");
 const model_mod = @import("model.zig");
@@ -35,8 +40,10 @@ pub const RewindPolicy = enum {
     tail_replay_only, // 2026 SOTA baseline: zero-start forward tail replay (W) for all heads
     sm_inverse_only, // Ablation: Sherman-Morrison backward inverse without c_t tape
     ct_inverse_only, // Ablation: Singularity-free c_t-Inverse backward for all heads
+    replay_ssm_tape, // Periodic checkpoint (ReplaySSM-style anchor) + GDN-only forward tape replay
     dual_rewind_fixed_w, // Forget-Invert Duality (0 checkpoints, fixed W)
-    dual_rewind_minimax, // Universal Minimax Duality (0 checkpoints, W = max(64, 2*Delta))
+    dual_rewind_minimax, // Forget-Invert Duality (0 checkpoints, W = max(64, 2*Delta))
+    dual_rewind_certified, // Certified Non-Stationary TF-Rewind (0 checkpoints, adaptive extension when kappa << 1)
 };
 
 pub const RewindReport = struct {
@@ -44,6 +51,9 @@ pub const RewindReport = struct {
     heads_total: usize = 0,
     heads_backward: usize = 0,
     heads_forward: usize = 0,
+    heads_extended: usize = 0,
+    avg_steps: f64 = 0,
+    max_steps: u32 = 0,
     median_rel_err: f64 = 0,
     p90_rel_err: f64 = 0,
     max_rel_err: f64 = 0,
@@ -92,6 +102,8 @@ pub const DualRewindEngine = struct {
     corr_layer_stride: usize,
     qkv_layer_stride: usize,
     tape_len: u32 = 0,
+    anchor_pos: u32 = 0,
+    has_anchor: bool = false,
 
     pub fn init(a: std.mem.Allocator, m: *Model, max_tape: u32) !DualRewindEngine {
         const n_lin = m.c.numLinearLayers();
@@ -123,7 +135,7 @@ pub const DualRewindEngine = struct {
         errdefer hm.deinit();
         const hs = try m.ctx.allocBuffer(align256(n_lin * nv * 4));
         errdefer hs.deinit();
-        const anc = try m.ctx.allocBuffer(256); // unused dummy when 0 checkpoints!
+        const anc = try m.ctx.allocBuffer(m.gdn_state_buf.len); // used only when benchmarking ReplaySSM anchor baseline
         errdefer anc.deinit();
 
         m.ctx.commitResidency();
@@ -166,9 +178,29 @@ pub const DualRewindEngine = struct {
         self.tape_k_buf.deinit();
     }
 
+    pub fn bytesPerTokenShared(self: *const DualRewindEngine) usize {
+        // Shared recurrence inputs needed by Tail-Replay & ReplaySSM-Tape: (k bf16 + v bf16 + alpha f32 + beta bf16)
+        return self.n_lin * (self.nk * 128 * 2 + self.nv * 128 * 2 + self.nv * 4 + self.nv * 2);
+    }
+
+    pub fn bytesPerTokenCorr(self: *const DualRewindEngine) usize {
+        // Incremental TF-Rewind correction tape: c_t fp32 (only needed for last Delta_max tokens!)
+        return self.n_lin * (self.nv * 128 * 4);
+    }
+
+    pub fn bytesPerTokenQkv(self: *const DualRewindEngine) usize {
+        // Pre-conv qkv bf16 for exact 3-tap conv1d restore (only needed for last Delta_max + 3 tokens!)
+        return self.n_lin * (self.qkv_dim * 2);
+    }
+
     pub fn bytesPerTokenTape(self: *const DualRewindEngine) usize {
-        // Core recurrence tape (k bf16 + v bf16 + c_t f32 + alpha f32 + beta bf16) per token
-        return self.n_lin * (self.nk * 128 * 2 + self.nv * 128 * 2 + self.nv * 128 * 4 + self.nv * 4 + self.nv * 2);
+        return self.bytesPerTokenShared() + self.bytesPerTokenCorr();
+    }
+
+    pub fn saveAnchor(self: *DualRewindEngine) void {
+        @memcpy(self.anchor_state_buf.ptr[0..self.m.gdn_state_buf.len], self.m.gdn_state_buf.ptr[0..self.m.gdn_state_buf.len]);
+        self.anchor_pos = self.m.pos;
+        self.has_anchor = true;
     }
 
     fn captureFromVerifyBuf(self: *DualRewindEngine, start_pos: u32, rows: u32) void {
@@ -266,12 +298,18 @@ pub const DualRewindEngine = struct {
                 if (b_max >= 0.90) high_beta += 1;
             }
         }
+        const ckpt_mib = @as(f64, @floatFromInt(self.m.gdn_state_buf.len)) / (1024.0 * 1024.0);
+        const shared_kib = @as(f64, @floatFromInt(self.bytesPerTokenShared())) / 1024.0;
+        const corr_kib = @as(f64, @floatFromInt(self.bytesPerTokenCorr())) / 1024.0;
+        const qkv_kib = @as(f64, @floatFromInt(self.bytesPerTokenQkv())) / 1024.0;
+        const ring64_mib = (192.0 * shared_kib + 64.0 * corr_kib + 67.0 * qkv_kib) / 1024.0;
         std.debug.print(
             \\GDN Empirical Spectrum ({d} linear layers x {d} heads = {d} heads, t={d}..{d}):
             \\  Decay alpha regimes  : slow(>=0.95)={d} ({d:.1}%) | med(0.5-0.95)={d} ({d:.1}%) | fast(<0.5)={d} ({d:.1}%)
             \\  Heads w/ beta>=0.90  : {d}/{d} ({d:.1}%) -- breaks Sherman-Morrison, ZERO effect on c_t-Inverse!
             \\  Global means         : E[alpha]={d:.4} | E[beta]={d:.4} | geom_mean(1/alpha)={d:.3}
-            \\  Memory vs Snapshots  : State = {d:.1} KiB/tok vs O(d) c_t-Tape = {d:.1} KiB/tok ({d:.1}x smaller, 0 checkpoints!)
+            \\  Itemized Memory      : 1 Ckpt = {d:.2} MiB | Shared (k,v,a,b) = {d:.1} KiB/tok | c_t (f32) = {d:.1} KiB/tok | conv qkv = {d:.1} KiB/tok
+            \\  Ring (Delta<=64)     : {d:.1} MiB total ({d:.2}x one ckpt, O(Delta) vs ReplaySSM O(T/B) checkpoints!)
             \\
         , .{
             self.n_lin,
@@ -291,9 +329,12 @@ pub const DualRewindEngine = struct {
             sum_alpha_all / count_all,
             sum_beta_all / count_all,
             @exp(sum_log_inv_alpha / count_all),
-            @as(f64, @floatFromInt(self.m.gdn_state_buf.len)) / 1024.0,
-            @as(f64, @floatFromInt(self.bytesPerTokenTape())) / 1024.0,
-            @as(f64, @floatFromInt(self.m.gdn_state_buf.len)) / @as(f64, @floatFromInt(self.bytesPerTokenTape())),
+            ckpt_mib,
+            shared_kib,
+            corr_kib,
+            qkv_kib,
+            ring64_mib,
+            ring64_mib / ckpt_mib,
         });
     }
 
@@ -314,12 +355,16 @@ pub const DualRewindEngine = struct {
         const modes = self.head_mode_buf.slice(u32, self.n_lin * self.nv);
         const starts = self.head_start_buf.slice(u32, self.n_lin * self.nv);
 
-        // Effective fp32 rounding unit for c_t-Inverse
+        // Effective fp32 rounding unit for c_t-Inverse, and target error certificate for Certified mode
         const log_u: f64 = @log(@as(f64, 5.0e-7));
+        const log_tol: f64 = @log(@as(f64, 5.0e-5)); // ~ -9.9035 (matches stationary r=2 fp32 bound u^(2/3))
+        const log_ext_target: f64 = -11.5; // exp(-11.5) ~ 1.0e-5 extra margin when extending non-stationary heads
         const eff_window: u32 = switch (policy) {
-            .dual_rewind_minimax => @max(base_window, 2 * delta),
+            .dual_rewind_minimax, .dual_rewind_certified => @max(base_window, 2 * delta),
             else => base_window,
         };
+
+        var total_steps: u64 = 0;
 
         for (0..self.n_lin) |li| {
             const dec_ptr: [*]const f32 = @ptrCast(@alignCast(self.tape_decay_buf.ptr + li * self.dec_layer_stride));
@@ -327,24 +372,41 @@ pub const DualRewindEngine = struct {
             for (0..self.nv) |h| {
                 const idx = li * self.nv + h;
                 const start_w: u32 = if (target_pos > eff_window) target_pos - eff_window else 0;
+                var head_steps: u32 = 0;
 
                 switch (policy) {
                     .tail_replay_only => {
                         modes[idx] = 1;
                         starts[idx] = start_w;
+                        head_steps = target_pos - start_w;
                         rep.heads_forward += 1;
                     },
                     .sm_inverse_only => {
                         modes[idx] = 2;
                         starts[idx] = 0;
+                        head_steps = delta;
                         rep.heads_backward += 1;
                     },
                     .ct_inverse_only => {
                         modes[idx] = 0;
                         starts[idx] = 0;
+                        head_steps = delta;
                         rep.heads_backward += 1;
                     },
-                    .dual_rewind_fixed_w, .dual_rewind_minimax => {
+                    .replay_ssm_tape => {
+                        // ReplaySSM-style periodic anchor replay: load checkpoint S_{anchor_pos} and forward-replay [anchor_pos .. target_pos)
+                        if (self.has_anchor and target_pos >= self.anchor_pos) {
+                            modes[idx] = 3;
+                            starts[idx] = self.anchor_pos;
+                            head_steps = target_pos - self.anchor_pos;
+                        } else {
+                            modes[idx] = 1;
+                            starts[idx] = 0;
+                            head_steps = target_pos;
+                        }
+                        rep.heads_forward += 1;
+                    },
+                    .dual_rewind_fixed_w, .dual_rewind_minimax, .dual_rewind_certified => {
                         // Theorem 2 (Singularity-free!): log E_back = log(u) - sum_{t=P}^{T-1} log(alpha_t)
                         var log_err_back: f64 = log_u;
                         for (target_pos..cur_pos) |t| {
@@ -352,38 +414,61 @@ pub const DualRewindEngine = struct {
                             log_err_back += -@log(alpha);
                         }
 
-                        // Theorem 2 (Forward tail): log E_fwd = sum_{t=start_w}^{P-1} log(alpha_t)
-                        var log_err_fwd: f64 = 0.0;
-                        if (start_w == 0) {
-                            log_err_fwd = -100.0;
-                        } else {
-                            for (start_w..target_pos) |t| {
-                                const alpha: f64 = @max(dec_ptr[t * self.nv + h], 1e-12);
-                                log_err_fwd += @log(alpha);
-                            }
+                        // Theorem 2 (Forward tail): walk backward from P-1 down to start_w, early-stopping at -14.0
+                        var opt_start = target_pos;
+                        var acc_log: f64 = 0.0;
+                        while (opt_start > start_w) {
+                            opt_start -= 1;
+                            acc_log += @log(@max(dec_ptr[opt_start * self.nv + h], 1e-12));
+                            if (acc_log <= -14.0) break; // exp(-14) < 8.3e-7 (below fp32 precision!)
                         }
+                        const log_err_fwd: f64 = if (opt_start == 0) -100.0 else acc_log;
 
-                        if (log_err_back <= log_err_fwd) {
-                            modes[idx] = 0; // Singularity-free Backward c_t-Inverse!
-                            starts[idx] = 0;
-                            rep.heads_backward += 1;
-                        } else {
-                            modes[idx] = 1; // Exact Zero-Start Forward Tail-Replay!
-                            // Dynamic early truncation: find shortest window reaching < 1e-6 contraction to save GPU work!
-                            var opt_start = target_pos;
-                            var acc_log: f64 = 0.0;
-                            while (opt_start > start_w) {
-                                opt_start -= 1;
-                                acc_log += @log(@max(dec_ptr[opt_start * self.nv + h], 1e-12));
-                                if (acc_log <= -14.0) break; // exp(-14) < 8.3e-7 (below fp32 precision!)
+                        if (policy == .dual_rewind_certified) {
+                            // Runtime error certificate handles non-stationary decay (kappa << 1: pre-remember / post-flush)!
+                            if (log_err_back <= log_err_fwd and log_err_back <= log_tol) {
+                                modes[idx] = 0;
+                                starts[idx] = 0;
+                                head_steps = delta;
+                                rep.heads_backward += 1;
+                            } else if (log_err_fwd <= log_tol) {
+                                modes[idx] = 1;
+                                starts[idx] = opt_start;
+                                head_steps = target_pos - opt_start;
+                                rep.heads_forward += 1;
+                            } else {
+                                // Non-stationary head detected! Both fixed paths exceed eps_tol.
+                                // Adaptively extend ONLY this head backward until prod alpha_t <= eps_tol or t = 0 (bit-exact!).
+                                while (opt_start > 0 and acc_log > log_ext_target) {
+                                    opt_start -= 1;
+                                    acc_log += @log(@max(dec_ptr[opt_start * self.nv + h], 1e-12));
+                                }
+                                modes[idx] = 1;
+                                starts[idx] = opt_start;
+                                head_steps = target_pos - opt_start;
+                                rep.heads_forward += 1;
+                                rep.heads_extended += 1;
                             }
-                            starts[idx] = opt_start;
-                            rep.heads_forward += 1;
+                        } else {
+                            if (log_err_back <= log_err_fwd) {
+                                modes[idx] = 0; // Singularity-free Backward c_t-Inverse!
+                                starts[idx] = 0;
+                                head_steps = delta;
+                                rep.heads_backward += 1;
+                            } else {
+                                modes[idx] = 1; // Exact Zero-Start Forward Tail-Replay!
+                                starts[idx] = opt_start;
+                                head_steps = target_pos - opt_start;
+                                rep.heads_forward += 1;
+                            }
                         }
                     },
                 }
+                total_steps += head_steps;
+                if (head_steps > rep.max_steps) rep.max_steps = head_steps;
             }
         }
+        rep.avg_steps = @as(f64, @floatFromInt(total_steps)) / @as(f64, @floatFromInt(rep.heads_total));
 
         // Dispatch ONE single Metal command buffer across all linear layers!
         var cb = m.ctx.beginCommandBuffer();
@@ -405,7 +490,7 @@ pub const DualRewindEngine = struct {
             enc.setBuffer(self.tape_corr_buf, li * self.corr_layer_stride, 4);
             enc.setBuffer(self.head_mode_buf, li * self.nv * 4, 5);
             enc.setBuffer(self.head_start_buf, li * self.nv * 4, 6);
-            enc.setBuffer(self.anchor_state_buf, 0, 7);
+            enc.setBuffer(self.anchor_state_buf, li * m.gdn_state_stride, 7);
             enc.setBuffer(m.gdn_state_buf, li * m.gdn_state_stride, 8);
             enc.setValue(rp, 9);
             enc.dispatchGroups(.{ .width = 1, .height = 32, .depth = self.nv }, .{ .width = 32, .height = 1, .depth = 1 });

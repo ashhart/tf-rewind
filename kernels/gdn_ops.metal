@@ -614,15 +614,17 @@ kernel void gdn_fused_step_1(const device vec<bfloat, 4>* in_proj_all [[buffer(0
 }
 
 // ============================================================================
-// Universal Forget-Invert Dual-Rewind Kernel (Singularity-Free c_t-Inverse!)
+// TF-Rewind (Forget-Invert Duality) Kernel — Singularity-Free c_t-Inverse
 //
-// Theorem (Singularity-Free Exact Delta Inverse via Correction Tape c_t):
+// Theorem 1 (Singularity-Free Exact Delta Inverse via Correction Tape c_t):
 //   Forward : S_t     = alpha_t * S_{t-1} + c_t k_t^T,  c_t = beta_t (v_t - alpha_t S_{t-1} k_t)
 //   Backward: S_{t-1} = (S_t - c_t k_t^T) / alpha_t     (ZERO beta singularity, ZERO dot products!)
 //
-// Theorem (Universal Minimax Duality — Zero Checkpoints):
-//   With tail window W = r * Delta, for ALL decay rates alpha in (0, 1] and ALL Delta >= 1:
-//     min( u * alpha^(-Delta), alpha^(r * Delta) ) <= u^(r / (r + 1))   [independent of alpha & Delta!]
+// Theorems 3-4 (Non-Stationary Minimax Duality & Runtime-Certified Replay):
+//   With W = r * Delta and decay-drift ratio kappa = ln(alpha_pre) / ln(alpha_post):
+//     min( E_back, E_fwd(W) ) <= u^( (r * kappa) / (r * kappa + 1) )  [u^(r/(r+1)) when kappa=1]
+//   Any non-stationary head (kappa << 1) exceeding eps_tol is detected on the host from alpha_t
+//   and adaptively extended backward via head_start[h] until prod alpha_t <= eps_tol (or t = 0).
 //
 // Per-head mode:
 //   mode == 0 : Backward c_t-Inverse S_{cur_pos} -> S_{target_pos} (slow-decay heads)

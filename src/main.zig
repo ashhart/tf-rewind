@@ -1545,7 +1545,7 @@ fn cmdDualRewind(a: std.mem.Allocator, ctx: *mtl.Context, model_dir: []const u8,
     const total_len: u32 = @intCast(@min(all_ids.len, 512));
     const seq = all_ids[0..total_len];
 
-    // 1. Run full recorded forward pass up to T = total_len (with optional anchor saved at t = 256)
+    // 1. Run full recorded forward pass up to T = total_len, saving a ReplaySSM periodic anchor at B = 256
     const prev_qmv = Model.use_qmv_1;
     const prev_split = Model.use_split_k;
     Model.use_qmv_1 = false;
@@ -1555,17 +1555,24 @@ fn cmdDualRewind(a: std.mem.Allocator, ctx: *mtl.Context, model_dir: []const u8,
         Model.use_split_k = prev_split;
     }
 
+    const anchor_b: u32 = @min(256, total_len / 2);
     m.reset();
-    _ = try eng.prefillRecorded(seq[0..total_len], 128);
+    _ = try eng.prefillRecorded(seq[0..anchor_b], 128);
+    eng.saveAnchor();
+    const anchor_state_cpu = try a.dupe(u8, m.gdn_state_buf.ptr[0..m.gdn_state_buf.len]);
+    defer a.free(anchor_state_cpu);
+    const anchor_hist_cpu = try a.dupe(u8, m.gdn_hist_buf.ptr[0..m.gdn_hist_buf.len]);
+    defer a.free(anchor_hist_cpu);
+    _ = try eng.prefillRecorded(seq[anchor_b..total_len], 128);
 
-    // Snapshot terminal state S_T & conv history so we can test all 5 policies from identical S_T!
+    // Snapshot terminal state S_T & conv history so we can test all policies from identical S_T!
     const term_state = try a.dupe(u8, m.gdn_state_buf.ptr[0..m.gdn_state_buf.len]);
     defer a.free(term_state);
     const term_hist = try a.dupe(u8, m.gdn_hist_buf.ptr[0..m.gdn_hist_buf.len]);
     defer a.free(term_hist);
 
-    std.debug.print("\n=== UNIVERSAL FORGET-INVERT DUAL-REWIND ABLATION ({s}, T={d}, W={d}, ZERO CHECKPOINTS) ===\n", .{
-        ctx.deviceName(), total_len, tail_w,
+    std.debug.print("\n=== TF-REWIND (FORGET-INVERT DUALITY) ABLATION & REPLAYSSM BENCH ({s}, T={d}, W={d}, Anchor B={d}) ===\n", .{
+        ctx.deviceName(), total_len, tail_w, anchor_b,
     });
     eng.printSpectrumStats(0, total_len);
 
@@ -1574,8 +1581,10 @@ fn cmdDualRewind(a: std.mem.Allocator, ctx: *mtl.Context, model_dir: []const u8,
         .{ .p = .tail_replay_only, .name = "Tail-Replay (SOTA)" },
         .{ .p = .sm_inverse_only, .name = "SM-Inverse Only" },
         .{ .p = .ct_inverse_only, .name = "c_t-Inverse Only" },
-        .{ .p = .dual_rewind_fixed_w, .name = "Dual-Rewind (W=64)" },
-        .{ .p = .dual_rewind_minimax, .name = "Dual-Rewind (2D)" },
+        .{ .p = .replay_ssm_tape, .name = "ReplaySSM (Tape)" },
+        .{ .p = .dual_rewind_fixed_w, .name = "TF-Rewind (W=64)" },
+        .{ .p = .dual_rewind_minimax, .name = "TF-Rewind (2D)" },
+        .{ .p = .dual_rewind_certified, .name = "TF-Rewind (Cert)" },
     };
 
     const ref_state_f32 = try a.alloc(f32, m.gdn_state_buf.len / 4);
@@ -1592,7 +1601,9 @@ fn cmdDualRewind(a: std.mem.Allocator, ctx: *mtl.Context, model_dir: []const u8,
 
         // Ground-truth cold forward pass up to target_pos
         m.reset();
+        const t_cold0 = nowMs();
         _ = try m.prefill(seq[0..target_pos], 128);
+        const cold_ms = nowMs() - t_cold0;
         @memcpy(std.mem.sliceAsBytes(ref_state_f32), m.gdn_state_buf.ptr[0..m.gdn_state_buf.len]);
         var gt_tok = try m.stepWithLogits(probe_tok);
         @memcpy(ref_logits, m.logits_buf.slice(u16, m.c.vocab_size));
@@ -1602,10 +1613,62 @@ fn cmdDualRewind(a: std.mem.Allocator, ctx: *mtl.Context, model_dir: []const u8,
             ref_gen[k] = gt_tok;
         }
 
-        std.debug.print("\n--- Rewind Delta = {d:3} (T={d} -> P={d}, ZERO checkpoints!) ---\n", .{ delta, total_len, target_pos });
-        std.debug.print("  {s:<19} | {s:<9} | {s:>6} | {s:>9} | {s:>9} | {s:>9} | {s:>8} | {s:>9} | {s:>7}\n", .{
-            "Policy", "Split B/F", "Time", "MedRelErr", "p90RelErr", "MaxRelErr", "H<1e-3", "KL(P||Q)", "TokPar",
+        std.debug.print("\n--- Rewind Delta = {d:3} (T={d} -> P={d}, Cold={d:.1}ms, ReplaySSM Anchor={d} -> {d} tok) ---\n", .{
+            delta, total_len, target_pos, cold_ms, anchor_b, if (target_pos >= anchor_b) target_pos - anchor_b else target_pos,
         });
+        std.debug.print("  {s:<19} | {s:<9} | {s:>4} | {s:>6} | {s:>8} | {s:>9} | {s:>9} | {s:>9} | {s:>8} | {s:>9} | {s:>6}\n", .{
+            "Policy", "Split B/F", "Ext", "AvgStp", "Time", "MedRelErr", "p90RelErr", "MaxRelErr", "H<1e-3", "KL(P||Q)", "TokPar",
+        });
+
+        // Baseline: ReplaySSM (Full-Model forward replay from periodic checkpoint at B = 256, 0 tape, 1 ckpt/256 tok)
+        {
+            const replay_start: u32 = if (target_pos >= anchor_b) anchor_b else 0;
+            if (replay_start == anchor_b) {
+                @memcpy(m.gdn_state_buf.ptr[0..m.gdn_state_buf.len], anchor_state_cpu);
+                @memcpy(m.gdn_hist_buf.ptr[0..m.gdn_hist_buf.len], anchor_hist_cpu);
+                m.pos = anchor_b;
+            } else {
+                m.reset();
+            }
+            const t_rssm0 = nowMs();
+            if (target_pos > replay_start) {
+                _ = try m.prefill(seq[replay_start..target_pos], 128);
+            }
+            const rssm_ms = nowMs() - t_rssm0;
+
+            var rep = rewind_mod.RewindReport{
+                .rewind_ms = rssm_ms,
+                .heads_total = eng.n_lin * eng.nv,
+                .heads_forward = eng.n_lin * eng.nv,
+                .avg_steps = @floatFromInt(target_pos - replay_start),
+            };
+            try eng.evaluateStateAccuracy(ref_state_f32, &rep);
+            var got_tok = try m.stepWithLogits(probe_tok);
+            const lcmp = rewind_mod.compareLogits(ref_logits, m.logits_buf.slice(u16, m.c.vocab_size));
+            rep.kl_div = lcmp.kl;
+            var matches: usize = if (got_tok == ref_gen[0]) 1 else 0;
+            for (1..gen_check) |k| {
+                got_tok = try m.step(got_tok);
+                if (got_tok == ref_gen[k]) matches += 1;
+            }
+            var split_buf: [20]u8 = undefined;
+            const split_str = std.fmt.bufPrint(&split_buf, "0/{d}", .{rep.heads_total}) catch "?";
+            std.debug.print("  {s:<19} | {s:<9} | {d:4} | {d:6.1} | {d:6.2}ms | {e:9.2} | {e:9.2} | {e:9.2} | {d:3}/{d:<4} | {e:9.2} | {d:2}/{d}\n", .{
+                "ReplaySSM (Full)",
+                split_str,
+                0,
+                rep.avg_steps,
+                rep.rewind_ms,
+                rep.median_rel_err,
+                rep.p90_rel_err,
+                rep.max_rel_err,
+                rep.exact_1e3_heads,
+                rep.heads_total,
+                rep.kl_div,
+                matches,
+                gen_check,
+            });
+        }
 
         for (policies) |pol| {
             @memcpy(m.gdn_state_buf.ptr[0..m.gdn_state_buf.len], term_state);
@@ -1631,9 +1694,11 @@ fn cmdDualRewind(a: std.mem.Allocator, ctx: *mtl.Context, model_dir: []const u8,
 
             var split_buf: [20]u8 = undefined;
             const split_str = std.fmt.bufPrint(&split_buf, "{d}/{d}", .{ rep.heads_backward, rep.heads_forward }) catch "?";
-            std.debug.print("  {s:<19} | {s:<9} | {d:4.2}ms | {e:9.2} | {e:9.2} | {e:9.2} | {d:3}/{d:<4} | {e:9.2} | {d:2}/{d}\n", .{
+            std.debug.print("  {s:<19} | {s:<9} | {d:4} | {d:6.1} | {d:6.2}ms | {e:9.2} | {e:9.2} | {e:9.2} | {d:3}/{d:<4} | {e:9.2} | {d:2}/{d}\n", .{
                 pol.name,
                 split_str,
+                rep.heads_extended,
+                rep.avg_steps,
                 rep.rewind_ms,
                 rep.median_rel_err,
                 rep.p90_rel_err,
@@ -1764,7 +1829,7 @@ fn cmdNeedleDemo(a: std.mem.Allocator, ctx: *mtl.Context, model_dir: []const u8,
     const DemoPolicy = struct { p: rewind_mod.RewindPolicy, label: []const u8 };
     const demo_pols = [_]DemoPolicy{
         .{ .p = .tail_replay_only, .label = "[2] Tail-Replay (2026 SOTA)    " },
-        .{ .p = .dual_rewind_minimax, .label = "[3] Dual-Rewind (OURS, 0 ckpt) " },
+        .{ .p = .dual_rewind_certified, .label = "[3] TF-Rewind (OURS, 0 ckpt)   " },
     };
 
     for (demo_pols) |dp| {

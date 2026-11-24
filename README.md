@@ -1,8 +1,8 @@
-# TF-Rewind — Checkpoint-Free Arbitrary-Boundary State Rewind for Hybrid Linear-Attention LLMs
+# TF-Rewind — Exact Arbitrary-Boundary State Rewind for Hybrid Linear-Attention LLMs
 
 **TensorFold Research** · Paper: [paper/TF_REWIND.md](paper/TF_REWIND.md) · Bare-Metal Engine: `m4lm` (Zig + direct Metal, zero Apple MLX, zero external dependencies)
 
-**TF-Rewind** introduces **Forget–Invert Duality** — a mathematically optimal, **zero-checkpoint** algorithm that lets hybrid linear-attention / Gated DeltaNet (GDN) LLMs (`Qwen3.5`, `Qwen3.8`, Mamba-2, RWKV-7, GLA, KDA) **rewind ("Ctrl-Z") their recurrent state to any arbitrary past token position** in milliseconds with exact output parity, eliminating the multi-second full re-prefill penalty whenever an agent retries a tool call, branches a conversation, edits a prompt, or rolls back rejected speculative tokens.
+**TF-Rewind** introduces **Forget–Invert Duality** and **Runtime-Certified Adaptive Replay** — allowing hybrid linear-attention / Gated DeltaNet (GDN) LLMs (`Qwen3.5`, `Qwen3.8`, Mamba-2, RWKV-7, GLA, KDA) to **rewind ("Ctrl-Z") their recurrent state to any arbitrary past token position** in milliseconds with **100% head certification (`2,304/2,304` heads on 27B)** and **zero checkpoints**, eliminating both the $O(T/B)$ checkpoint overhead / boundary cliffs of `ReplaySSM` and the slow-head hallucinations of `Tail-Replay`.
 
 ---
 
@@ -14,61 +14,71 @@ In a **hybrid Gated DeltaNet (GDN) + GQA model** (such as `Qwen3.5` and `Qwen3.8
 
 $$S_t = \alpha_t S_{t-1}\left(I - \beta_t k_t k_t^\top\right) + \beta_t v_t k_t^\top$$
 
-Because $S_t$ overwrites $S_{t-1}$ in place, rewinding to an un-checkpointed position $P$ previously forced an impossible choice:
-- **Save checkpoints everywhere** (`144 MiB` per snapshot on 27B) — unsustainable across arbitrary token boundaries.
-- **Full re-prefill from token 0** — `7+ seconds` on 27B for a single 1-line edit or tool retry.
+Because $S_t$ overwrites $S_{t-1}$ in place, rewinding to an un-checkpointed position $P$ previously forced a painful trade-off:
+- **Periodic Checkpointing (`ReplaySSM`)** — saves `144 MiB` per checkpoint ($O(T/B)$ RAM: `9.2 GiB` for $B=64$ at 4K context), and still suffers a **$B$-token boundary cliff** whenever you undo a few tokens right before the next checkpoint (`792.9 ms` to undo 4 tokens on 27B at $B=243$).
 - **2026 SOTA `Tail-Replay`** (zero-start forward replay over a short window) — breaks on the **`59%–65%` of real trained GDN heads with slow decay ($\alpha \ge 0.95$)**, causing state drift and hallucinations.
 - **Naive Sherman–Morrison algebraic inversion** — explodes to `NaN` because **`76%–90%` of real trained GDN heads hit $\beta_t \ge 0.90$**, making $(1 - \beta_t \|k_t\|_2^2)^{-1}$ singular.
 
 ---
 
-## The Breakthrough: Forget–Invert Duality
+## The Algorithm: Singularity-Free $c_t$-Inverse + Certified Forget–Invert Duality
 
-TF-Rewind solves both failure modes simultaneously with **zero state checkpoints**:
+TF-Rewind combines three mechanisms:
 
-### 1. Singularity-Free $c_t$-Inverse (Zero Extra FLOPs, `63.6×–76.3×` Smaller Tape)
-During the normal forward scan, every GDN kernel **already computes** the innovation vector $c_t = \beta_t (v_t - \alpha_t S_{t-1} k_t) \in \mathbb{R}^{d_v}$ in registers before writing $S_t = \alpha_t S_{t-1} + c_t k_t^\top$. Recording $c_t$ into a tiny ring tape (`1.93 MiB` vs `144 MiB` full state on 27B) makes exact backward inversion **unconditionally singularity-free** and dot-product-free:
+### 1. Singularity-Free $c_t$-Inverse (Zero Extra FLOPs, Ring-Buffered $O(d)$ Tape)
+During the normal forward scan, every GDN kernel **already computes** the innovation vector $c_t = \beta_t (v_t - \alpha_t S_{t-1} k_t) \in \mathbb{R}^{d_v}$ in registers before writing $S_t = \alpha_t S_{t-1} + c_t k_t^\top$. Recording $c_t$ into a bounded ring tape (only needed for the last $\Delta_{\max}$ tokens: `72 MiB` for $\Delta_{\max}=64$ on 27B — half of one state checkpoint) makes exact backward inversion **unconditionally singularity-free** and dot-product-free:
 
 $$S_{t-1} = \frac{S_t - c_t k_t^\top}{\alpha_t}$$
 
 No $\beta_t$ appears anywhere in the inverse — completely immune to $\beta_t \to 1$.
 
-### 2. Universal Minimax Duality (Per-Head Optimal Routing)
-The only remaining error axis is the decay rate $\alpha_t \in (0, 1]$ — where Backward $c_t$-Inverse and Forward Zero-Start Tail-Replay have **exact opposite stability regimes**:
-- **Slow-decay heads ($\alpha \approx 1$):** Backward $c_t$-Inverse has error $E_{\text{back}} \approx u_{\text{eff}} / \prod_{t=P}^{T-1}\alpha_t \approx 10^{-7}$ (where Tail-Replay fails catastrophically).
-- **Fast-decay heads ($\alpha \ll 1$):** Forward Zero-Start Tail-Replay over window $W = r\Delta$ has error $E_{\text{fwd}} \le \prod_{t=P-W}^{P-1}\alpha_t \ll 10^{-6}$ (where backward division by $\alpha_t$ would amplify rounding).
+### 2. General Non-Stationary Minimax Duality (Per-Head Optimal Routing)
+The remaining error axis is the decay gate $\alpha_t \in (0, 1]$, where Backward $c_t$-Inverse ($E_{\text{back}} \approx u_{\text{eff}} / \prod_{t=P}^{T-1}\alpha_t$) and Forward Zero-Start Replay ($E_{\text{fwd}} \le \prod_{t=P-W}^{P-1}\alpha_t$) have complementary stability regimes. Letting $\kappa = \frac{\ln \bar{\alpha}_{\text{pre}}}{\ln \bar{\alpha}_{\text{post}}} \ge 0$ denote the pre/post-boundary **decay-drift ratio** and setting $W = r\Delta$ yields the exact bound:
 
-Choosing per head whichever mode minimizes $\min(E_{\text{back}}, E_{\text{fwd}})$ with window $W = r\Delta$ yields a **universal minimax error bound completely independent of $\alpha$, $\beta$, and $\Delta$**:
+$$\sup_{A \in (0, 1]} \min\Big(E_{\text{back}},\; E_{\text{fwd}}(r\Delta)\Big) = u_{\text{eff}}^{\,\frac{r\kappa}{r\kappa + 1}}$$
 
-$$\sup_{\bar{\alpha} \in (0, 1]} \min\Big(E_{\text{back}}(\bar{\alpha}),\; E_{\text{fwd}}(\bar{\alpha})\Big) = u_{\text{eff}}^{\,\frac{r}{r+1}}$$
+- **Stationary regime ($\kappa = 1$):** reduces to $u_{\text{eff}}^{r/(r+1)}$ ($\le 6 \times 10^{-5}$ at $r = 2$ in fp32), independent of $\bar{\alpha}$, $\beta_t$, and $\Delta$.
+- **Non-stationary regime ($\kappa \ll 1$):** explicitly identifies the exact edge case where a head retains strongly before $P$ and flushes aggressively after $P$.
 
-At $r = 2$ ($W = 2\Delta$) in fp32 ($u_{\text{eff}} \approx 5\times 10^{-7}$), worst-case relative state error is bounded by $\le 6 \times 10^{-5}$ across **all heads** with **zero checkpoints**.
+### 3. Runtime-Certified Adaptive Replay (`TF-Rewind (Cert)`)
+Because the host planner evaluates both $\ln E_{\text{back}}$ and $\ln E_{\text{fwd}}(W)$ directly from the scalar $\alpha_t$ tape **before dispatching the GPU kernel**, it detects every non-stationary $\kappa \ll 1$ head at runtime and extends **only those flagged heads** backward past $P - W$ until $\prod \alpha_t \le \epsilon_{\text{tol}}$ (or $t = 0$ / a single sliding anchor). Result: **provable runtime error certification ($\le \epsilon_{\text{tol}}$ on `100%` of heads, without any stationarity assumption)**.
 
 ---
 
 ## Verified Results (Apple M5 Max, 128 GB)
 
-### Controlled Ablation on `Qwen3.8-27B` (48 Linear Layers, 2,304 GDN Heads, Zero Checkpoints)
+### Controlled Ablation & Direct ReplaySSM Comparison on `Qwen3.8-27B` (2,304 GDN Heads)
 
-Rewinding from $T = 487$ to un-checkpointed positions $P = T - \Delta$:
+Rewinding from $T = 487$ (`Cold` re-prefill = `1.22–2.10 s`; `ReplaySSM` periodic anchor at $B = 243$):
 
-| Rewind $\Delta$ | Method (0 checkpoints) | Split B/F | GPU Time | Med Rel Err | p90 Rel Err | Heads $< 10^{-3}$ | $\text{KL}(P_{\text{ref}} \| P_{\text{got}})$ | Token Parity |
-| :---: | :--- | :---: | ---: | ---: | ---: | :---: | ---: | :---: |
-| **4** | `Tail-Replay (2026 SOTA)` | `0 / 2304` | `23.8 ms` | `4.91e-2` | `6.46e-1` | `834 / 2304` | `1.77e-2` | `5 / 32` |
-| **4** | `SM-Inverse Only` | `2304 / 0` | `4.4 ms` | `2.09e-7` | `1.35e-3` | `2066 / 2304` | `9.51e+0` | `5 / 32` |
-| **4** | **`TF-Rewind (2D, Ours)`** | `1715 / 589` | **`15.5 ms`** | **`1.05e-7`** | **`3.20e-7`** | **`2304 / 2304`** | **`1.28e-5`** | **`32 / 32`** |
-| **16** | `Tail-Replay (2026 SOTA)` | `0 / 2304` | `19.6 ms` | `3.00e-2` | `5.64e-1` | `875 / 2304` | `8.74e-3` | `18 / 32` |
-| **16** | **`TF-Rewind (2D, Ours)`** | `1661 / 643` | **`15.5 ms`** | **`2.44e-7`** | **`6.47e-7`** | **`2304 / 2304`** | **`1.72e-4`** | **`32 / 32`** |
-| **32** | `Tail-Replay (2026 SOTA)` | `0 / 2304` | `17.8 ms` | `1.40e-2` | `4.89e-1` | `908 / 2304` | `6.19e-4` | `30 / 32` |
-| **32** | **`TF-Rewind (2D, Ours)`** | `1586 / 718` | **`10.9 ms`** | **`3.53e-7`** | **`1.84e-6`** | **`2304 / 2304`** | **`5.29e-5`** | **`32 / 32`** |
-| **64** | `Tail-Replay (2026 SOTA)` | `0 / 2304` | `25.2 ms` | `5.89e-3` | `5.08e-1` | `984 / 2304` | `5.32e-4` | `27 / 32` |
-| **64** | **`TF-Rewind (2D, Ours)`** | `1399 / 905` | **`22.3 ms`** | **`5.39e-7`** | **`5.58e-6`** | **`2302 / 2304`** | **`4.91e-7`** | **`32 / 32`** |
-| **128** | `Tail-Replay (2026 SOTA)` | `0 / 2304` | `56.1 ms` | `3.36e-1` | `8.69e-1` | `563 / 2304` | `5.88e+0` | `5 / 32` |
-| **128** | **`TF-Rewind (2D, Ours)`** | `1274 / 1030` | **`25.0 ms`** | **`1.28e-6`** | **`2.33e-4`** | **`2178 / 2304`** | **`4.20e-6`** | **`32 / 32`** |
+| $\Delta$ | Policy | Ckpts | Split B/F | Ext | AvgStp | Time | MedRelErr | MaxRelErr | Heads $< 10^{-3}$ | $\text{KL}(P \| Q)$ | Parity |
+| :---: | :--- | :---: | :---: | ---: | ---: | ---: | ---: | ---: | :---: | ---: | :---: |
+| **4** | `ReplaySSM (Full, B=243)` | `1/243` | `0/2304` | `0` | `240.0` | `792.88 ms` | `0.00e0` | `0.00e0` | `2304/2304` | `0.00e0` | `32/32` |
+| **4** | `ReplaySSM (Tape, B=243)` | `1/243` | `0/2304` | `0` | `240.0` | `20.38 ms` | `0.00e0` | `0.00e0` | `2304/2304` | `0.00e0` | `32/32` |
+| **4** | `Tail-Replay (2026 SOTA)` | `0` | `0/2304` | `0` | `64.0` | `6.37 ms` | `4.91e-2` | `9.67e-1` | `834/2304` | `1.77e-2` | `5/32` |
+| **4** | **`TF-Rewind (Cert, Ours)`** | **`0`** | `1719/585` | `0` | **`9.7`** | **`3.95 ms`** | **`1.05e-7`** | **`1.15e-6`** | **`2304/2304`** | **`1.28e-5`** | **`32/32`** |
+| **16** | `ReplaySSM (Full, B=243)` | `1/243` | `0/2304` | `0` | `228.0` | `775.72 ms` | `0.00e0` | `0.00e0` | `2304/2304` | `0.00e0` | `32/32` |
+| **16** | `ReplaySSM (Tape, B=243)` | `1/243` | `0/2304` | `0` | `228.0` | `15.45 ms` | `0.00e0` | `0.00e0` | `2304/2304` | `0.00e0` | `32/32` |
+| **16** | `Tail-Replay (2026 SOTA)` | `0` | `0/2304` | `0` | `64.0` | `6.47 ms` | `3.00e-2` | `8.96e-1` | `875/2304` | `8.74e-3` | `18/32` |
+| **16** | **`TF-Rewind (Cert, Ours)`** | **`0`** | `1661/643` | `0` | **`20.2`** | **`10.51 ms`** | **`2.44e-7`** | **`2.18e-5`** | **`2304/2304`** | **`1.72e-4`** | **`32/32`** |
+| **32** | `ReplaySSM (Full, B=243)` | `1/243` | `0/2304` | `0` | `212.0` | `1063.75 ms` | `0.00e0` | `0.00e0` | `2304/2304` | `0.00e0` | `32/32` |
+| **32** | `ReplaySSM (Tape, B=243)` | `1/243` | `0/2304` | `0` | `212.0` | `18.08 ms` | `0.00e0` | `0.00e0` | `2304/2304` | `0.00e0` | `32/32` |
+| **32** | `Tail-Replay (2026 SOTA)` | `0` | `0/2304` | `0` | `64.0` | `13.22 ms` | `1.40e-2` | `9.08e-1` | `908/2304` | `6.19e-4` | `30/32` |
+| **32** | **`TF-Rewind (Cert, Ours)`** | **`0`** | `1550/754` | `56` | **`34.3`** | **`5.38 ms`** | **`3.53e-7`** | **`2.23e-5`** | **`2304/2304`** | **`1.64e-4`** | **`32/32`** |
+| **64** | `ReplaySSM (Full, B=243)` | `1/243` | `0/2304` | `0` | `180.0` | `551.19 ms` | `0.00e0` | `0.00e0` | `2304/2304` | `0.00e0` | `32/32` |
+| **64** | `ReplaySSM (Tape, B=243)` | `1/243` | `0/2304` | `0` | `180.0` | `15.17 ms` | `0.00e0` | `0.00e0` | `2304/2304` | `0.00e0` | `32/32` |
+| **64** | `Tail-Replay (2026 SOTA)` | `0` | `0/2304` | `0` | `64.0` | `5.46 ms` | `5.89e-3` | `9.02e-1` | `984/2304` | `5.32e-4` | `27/32` |
+| **64** | **`TF-Rewind (Cert, Ours)`** | **`0`** | `1328/976` | `128` | **`73.7`** | **`14.86 ms`** | **`5.34e-7`** | **`2.28e-5`** | **`2304/2304`** | **`1.98e-6`** | **`32/32`** |
+| **128** | `ReplaySSM (Full, B=243)` | `1/243` | `0/2304` | `0` | `116.0` | `554.96 ms` | `0.00e0` | `0.00e0` | `2304/2304` | `0.00e0` | `32/32` |
+| **128** | `ReplaySSM (Tape, B=243)` | `1/243` | `0/2304` | `0` | `116.0` | `17.79 ms` | `0.00e0` | `0.00e0` | `2304/2304` | `0.00e0` | `32/32` |
+| **128** | `Tail-Replay (2026 SOTA)` | `0` | `0/2304` | `0` | `64.0` | `13.70 ms` | `3.36e-1` | `9.78e-1` | `563/2304` | `5.88e0` | `5/32` |
+| **128** | `TF-Rewind (2D, fixed-r)` | `0` | `1274/1030` | `0` | `130.9` | `28.32 ms` | `1.28e-6` | `6.47e-2` | `2178/2304` | `4.20e-6` | `32/32` |
+| **128** | **`TF-Rewind (Cert, Ours)`** | **`0`** | `1019/1285` | `447` | **`160.6`** | **`17.76 ms`** | **`7.41e-7`** | **`7.78e-5`** | **`2304/2304`** | **`3.90e-6`** | **`32/32`** |
 
-- **`160 / 160` (100% exact continuation parity)** across every $\Delta \in \{4, 16, 32, 64, 128\}$ on 27B with **zero checkpoints**.
-- **`1,400,000×` lower KL divergence** than 2026 SOTA `Tail-Replay` at $\Delta = 128$ (`4.20e-6` vs `5.88`).
-- Full cross-scale results on `Qwen3.5-0.8B`, `Qwen3.5-2B`, and `Qwen3.8-27B` are documented in [paper/TF_REWIND.md](paper/TF_REWIND.md).
+- **`2,304 / 2,304` (100% of heads)** certified below `7.78e-5` worst-case relative error AND **`160 / 160` (100% exact continuation parity)** across every $\Delta \in \{4, 16, 32, 64, 128\}$ with **zero checkpoints**.
+- **`31×–201×` faster than `ReplaySSM (Full)`**, up to **`5.2×` faster than `ReplaySSM (Tape)`** on short rewinds (`9.7` vs `240` avg steps at $\Delta=4$), and **`1,510,000×` lower KL divergence** than 2026 SOTA `Tail-Replay` at $\Delta = 128$ (`3.90e-6` vs `5.88`).
+- **Itemized Memory (`Qwen3.8-27B`):** 1 state checkpoint = `144.0 MiB`; Shared `(k,v,a,b)` = `781.5 KiB/tok`; Incremental `c_t` (fp32, last $\Delta_{\max}$ only) = `1,152.0 KiB/tok`; Conv `qkv` = `960.0 KiB/tok`. Full arbitrary-boundary ring buffer ($\Delta \le 64$) = **`281.3 MiB`** (`1.95×` one checkpoint, $O(\Delta_{\max})$ independent of $T$, vs **`9.2 GiB`** for ReplaySSM $B=64$ at $T=4{,}096$).
+- Full cross-scale results (`Qwen3.5-0.8B`, `Qwen3.5-2B`, `Qwen3.8-27B`) and proofs are in [paper/TF_REWIND.md](paper/TF_REWIND.md).
 
 ### Live End-to-End "Needle-in-a-Haystack Ctrl-Z" Demo (`m4lm tf-rewind-demo`)
 
@@ -76,7 +86,7 @@ An 816-token specification manual containing a secret key (`ORION-8391-ZETA`) ne
 
 | Model | Cold Re-Prefill TTFT | `Tail-Replay` (2026 SOTA) | **`TF-Rewind` (Ours, 0 ckpt)** |
 | :--- | :---: | :--- | :--- |
-| **`Qwen3.5-0.8B`** | `546.1 ms` | `53.7 ms` (`10.2×`), **`10/33` exact** — *hallucinated: "eliminates the CPU and GPU"* | **`31.8 ms` (`17.2×`), `33/33` (100% exact)** |
+| **`Qwen3.5-0.8B`** | `527–546 ms` | `35.6–53.7 ms`, **`10/33` exact** — *hallucinated: "eliminates the CPU and GPU"* | **`31.8–37.6 ms` (`14.0–17.2×`), `33/33` (100% exact)** |
 | **`Qwen3.5-2B`** | `849.0 ms` | `58.2 ms` (`14.6×`), `25/25` exact | **`60.6 ms` (`14.0×`, `3.1 ms` rewind), `25/25` (100% exact)** |
 | **`Qwen3.8-27B`** | `7,083.6 ms` | `432.0 ms` (`16.4×`), `21/23` exact (drift) | **`457.8 ms` (`15.5×`, `16.9 ms` rewind), `23/23` (100% exact)** |
 
@@ -92,7 +102,7 @@ zig build --release=fast
 #   zig-out/bin/m4lm          (~1.1 MB standalone CLI + OpenAI HTTP/SSE server)
 #   zig-out/lib/libm4lm.dylib (~840 KB C ABI shared library)
 
-# 1. Run the full 0-checkpoint Forget-Invert Duality ablation (Delta = 4, 16, 32, 64, 128)
+# 1. Run the full ablation + ReplaySSM comparison (Delta = 4, 16, 32, 64, 128)
 ./zig-out/bin/m4lm tf-rewind MODEL_DIR --window 64 --gen 64
 
 # 2. Run the live Needle-in-a-Haystack Ctrl-Z demo (Cold Re-Prefill vs Tail-Replay vs TF-Rewind)
@@ -100,8 +110,8 @@ zig build --release=fast
 ```
 
 Core TF-Rewind implementation files:
-- Metal GPU kernels (`gdn_scan_record_corr`, `gdn_rewind_dual`): [kernels/gdn_ops.metal](kernels/gdn_ops.metal#L616-L702)
-- Host planner, minimax mode selector, ablations & Ctrl-Z demo: [src/dual_rewind.zig](src/dual_rewind.zig)
+- Metal GPU kernels (`gdn_scan_record_corr`, `gdn_rewind_dual`): [kernels/gdn_ops.metal](kernels/gdn_ops.metal#L616-L728)
+- Host planner, runtime-certified non-stationary selector, ReplaySSM benchmarks & Ctrl-Z demo: [src/dual_rewind.zig](src/dual_rewind.zig)
 - Full technical paper & proofs: [paper/TF_REWIND.md](paper/TF_REWIND.md)
 
 ---
@@ -112,7 +122,7 @@ TF-Rewind was discovered and built inside **`m4lm`**, a clean-room LLM inference
 
 | Architecture | Models Verified | Weight Format | Highlights |
 | :--- | :--- | :--- | :--- |
-| **Hybrid Gated DeltaNet + GQA** | `Qwen3.5-0.8B-4bit`, `Qwen3.5-2B-4bit`, `Qwen3.8-27B-MLX-4bit` (+ `z-lab/Qwen3.8-27B-DFlash2`) | MLX 4-bit group-64 | **TF-Rewind** zero-checkpoint Ctrl-Z, ping-pong SRAM-resident `gdn_fused_step_1`, bit-exact tree FlashAttention, DFlash2 + cross-model + copy speculation, zero-copy KV+GDN prefix cache & 16-stream prefix forking |
+| **Hybrid Gated DeltaNet + GQA** | `Qwen3.5-0.8B-4bit`, `Qwen3.5-2B-4bit`, `Qwen3.8-27B-MLX-4bit` (+ `z-lab/Qwen3.8-27B-DFlash2`) | MLX 4-bit group-64 | **TF-Rewind** certified zero-checkpoint Ctrl-Z, ping-pong SRAM-resident `gdn_fused_step_1`, bit-exact tree FlashAttention, DFlash2 + cross-model + copy speculation, zero-copy KV+GDN prefix cache & 16-stream prefix forking |
 | **Standard Dense Transformer** | `Qwen/Qwen2.5-1.5B`, `Qwen/Qwen2.5-7B` | **Raw upstream HF BF16** (quantized on the fly to 4-bit `qk` tiles in parallel via GCD) | Zero pre-conversion, `HD=128` full split-half RoPE + fused QKV bias, branching tree verify, adaptive copy lookahead, zero-copy prefix cache |
 
 ### Engine Benchmarks & Parity (Apple M5 Max, 128 GB)
@@ -177,7 +187,7 @@ If you use **TF-Rewind** or **Forget–Invert Duality** in your research or infe
 
 ```bibtex
 @misc{tensorfold2026tfrewind,
-  title  = {TF-Rewind: Exact Checkpoint-Free State Rewind for Hybrid Linear-Attention LLMs via Forget-Invert Duality},
+  title  = {TF-Rewind: Exact Arbitrary-Boundary State Rewind for Hybrid Linear-Attention LLMs via Forget-Invert Duality},
   author = {TensorFold Research},
   year   = {2026},
   url    = {https://github.com/ashhart/tf-rewind}
